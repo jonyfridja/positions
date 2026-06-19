@@ -37,13 +37,35 @@ services:
       DATABASE_URL: "postgresql://postgres:postgres@db:5432/position_tracker?schema=public"
       APP_PASSWORD: "${APP_PASSWORD:-changeme}"
       AUTH_SECRET: "${AUTH_SECRET:-dev-secret-change-me}"
+      # Public hostname(s) the app is served from, so Next.js accepts Server
+      # Action POSTs from behind the tunnel. Comma-separated; empty in local dev.
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-}"
+    # Bound to localhost only: public traffic arrives via the tunnel, not this
+    # published port. Use it for on-box/LAN debugging (curl localhost:3000).
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       db:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+
+  # Cloudflare Tunnel: makes an OUTBOUND connection to Cloudflare and serves
+  # tracker.jony.fr without any open inbound ports / port forwarding. The route
+  # (hostname -> http://app:3000) and TLS are configured in the Cloudflare
+  # Zero Trust dashboard; this container just needs the tunnel token.
+  # Only starts when the "tunnel" profile is enabled (see docs).
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: "${TUNNEL_TOKEN:-}"
+    depends_on:
+      app:
+        condition: service_started
+    profiles:
+      - tunnel
 
 volumes:
   db_data:

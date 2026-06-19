@@ -3,17 +3,28 @@
 The app ships as a Docker Compose stack: a Postgres database, a one-shot schema-sync job, and
 the Next.js app running in standalone mode.
 
+> Self-hosting on a Raspberry Pi at home, reachable on a custom domain over HTTPS? See
+> [deploy-raspberry-pi.md](deploy-raspberry-pi.md) — it covers ARM, the Cloudflare Tunnel
+> (`tunnel` Compose profile), the `ALLOWED_ORIGINS` Server-Action fix, and optional CI/CD.
+
 ## Compose services (`docker-compose.yml`)
 
 | Service | Image / build | Role |
 | --- | --- | --- |
 | `db` | `postgres:16-alpine` | Database. Has a `pg_isready` healthcheck; data persisted in the `db_data` volume. Exposes `5432`. |
 | `migrate` | built from `target: migrator` | **One-shot.** Waits for `db` healthy, runs `prisma db push --skip-generate --accept-data-loss`, exits 0. `restart: "no"`. |
-| `app` | built from `target: runner` | The Next.js server on `3000`. Starts only after `db` is healthy **and** `migrate` completed successfully. |
+| `app` | built from `target: runner` | The Next.js server on `3000` (published to `127.0.0.1` only). Starts after `db` is healthy **and** `migrate` completed successfully. |
+| `tunnel` | `cloudflare/cloudflared` | **Opt-in** (`profiles: [tunnel]`). Serves the app publicly via an outbound Cloudflare Tunnel — no open inbound ports. Needs `TUNNEL_TOKEN`. See [deploy-raspberry-pi.md](deploy-raspberry-pi.md). |
 
 Env (`APP_PASSWORD`, `AUTH_SECRET`) is read from the host shell / `.env`, with `changeme` /
 `dev-secret-change-me` fallbacks for local convenience. **Override both in any real deployment.**
-`DATABASE_URL` is hardcoded in compose to the internal `db` host.
+`DATABASE_URL` is hardcoded in compose to the internal `db` host. `ALLOWED_ORIGINS` (public
+hostname, for the Server-Action origin check behind a proxy) and `TUNNEL_TOKEN` are read from
+`.env`; both are empty/unused in plain local runs.
+
+> The `tunnel` service only starts when you pass `--profile tunnel` (e.g.
+> `docker compose --profile tunnel up -d`). Plain `docker compose up` runs just `db` + `migrate`
+> + `app`, unchanged from before.
 
 ## Dockerfile stages (`Dockerfile`)
 

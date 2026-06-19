@@ -16,6 +16,7 @@ than none for an AI that trusts them.
 | [conventions.md](conventions.md) | You're writing code and want to match existing patterns. |
 | [development.md](development.md) | You're running, seeding, or debugging the app locally or in Docker. |
 | [deployment.md](deployment.md) | You're changing the Docker build, env vars, or how it ships. |
+| [deploy-raspberry-pi.md](deploy-raspberry-pi.md) | You're self-hosting on a Raspberry Pi behind a Cloudflare Tunnel (home server, custom domain). |
 | [playbooks.md](playbooks.md) | You're making a common change (add a field, add a status, etc.) and want the recipe. |
 
 ## The 30-second model

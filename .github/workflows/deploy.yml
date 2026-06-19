@@ -1,0 +1,33 @@
+# Auto-deploy to the Raspberry Pi on every push to main.
+#
+# This runs on a SELF-HOSTED runner installed on the Pi itself (labelled
+# "self-hosted"), because a home Pi behind NAT/CGNAT cannot accept inbound SSH
+# from GitHub's cloud runners. The runner polls GitHub outbound, then rebuilds
+# and restarts the Compose stack locally. See docs/deploy-raspberry-pi.md.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Never run two deploys at once; cancel an in-flight one if a newer push lands.
+concurrency:
+  group: deploy-pi
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, ARM64]
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@v4
+
+      - name: Build and (re)start the stack
+        working-directory: ${{ github.workspace }}
+        run: |
+          # .env lives next to the deploy checkout on the Pi and holds the real
+          # secrets (APP_PASSWORD, AUTH_SECRET, ALLOWED_ORIGINS, TUNNEL_TOKEN).
+          # It is NOT in git; symlink or copy it into the workspace once.
+          docker compose --profile tunnel up -d --build
+          docker image prune -f
