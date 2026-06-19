@@ -1,0 +1,39 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Application {
+  id        String    @id @default(cuid())
+  company   String
+  role      String
+  status    String    @default("WISHLIST") // WISHLIST | APPLIED | INTERVIEW | OFFER | REJECTED
+  location  String?
+  salary    String?
+  link      String?
+  notes     String?
+  appliedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  events Event[]
+
+  @@index([status])
+}
+
+model Event {
+  id            String   @id @default(cuid())
+  applicationId String
+  type          String // CREATED | STATUS_CHANGE | NOTE | UPDATED
+  message       String
+  createdAt     DateTime @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+}
