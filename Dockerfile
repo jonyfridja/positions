@@ -16,6 +16,11 @@ RUN pnpm install --frozen-lockfile
 # ---- Build the Next.js app (standalone output) ----
 FROM base AS builder
 ENV NEXT_TELEMETRY_DISABLED=1
+# Public origin(s) for the Server-Action check. Baked in at build time because
+# Next serializes next.config into the standalone output. Passed by compose from
+# the ALLOWED_ORIGINS env (a GitHub Actions secret in CI); empty for local builds.
+ARG ALLOWED_ORIGINS=""
+ENV ALLOWED_ORIGINS=$ALLOWED_ORIGINS
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN pnpm exec prisma generate

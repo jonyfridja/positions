@@ -32,26 +32,28 @@ services:
     build:
       context: .
       target: runner
+      args:
+        # Public origin(s) for the Server-Action check, baked in at build time.
+        # Supplied by CI from a secret; empty locally / before a domain exists.
+        ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-}"
     restart: unless-stopped
     environment:
       DATABASE_URL: "postgresql://postgres:postgres@db:5432/position_tracker?schema=public"
       APP_PASSWORD: "${APP_PASSWORD:-changeme}"
       AUTH_SECRET: "${AUTH_SECRET:-dev-secret-change-me}"
-      # Public hostname(s) the app is served from, so Next.js accepts Server
-      # Action POSTs from behind the tunnel. Comma-separated; empty in local dev.
-      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-}"
-    # Bound to localhost only: public traffic arrives via the tunnel, not this
-    # published port. Use it for on-box/LAN debugging (curl localhost:3000).
+    # Published on all interfaces by default so the app is reachable on the LAN
+    # at http://<pi-ip>:3000 (handy before a domain/tunnel exists). Set
+    # APP_BIND_ADDR=127.0.0.1 to restrict to the box once the tunnel fronts it.
     ports:
-      - "127.0.0.1:3000:3000"
+      - "${APP_BIND_ADDR:-0.0.0.0}:3000:3000"
     depends_on:
       db:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
 
-  # Cloudflare Tunnel: makes an OUTBOUND connection to Cloudflare and serves
-  # tracker.jony.fr without any open inbound ports / port forwarding. The route
+  # Cloudflare Tunnel: makes an OUTBOUND connection to Cloudflare and serves the
+  # app on your domain without any open inbound ports / port forwarding. The route
   # (hostname -> http://app:3000) and TLS are configured in the Cloudflare
   # Zero Trust dashboard; this container just needs the tunnel token.
   # Only starts when the "tunnel" profile is enabled (see docs).

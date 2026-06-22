@@ -1,9 +1,15 @@
 # Auto-deploy to the Raspberry Pi on every push to main.
 #
-# This runs on a SELF-HOSTED runner installed on the Pi itself (labelled
-# "self-hosted"), because a home Pi behind NAT/CGNAT cannot accept inbound SSH
-# from GitHub's cloud runners. The runner polls GitHub outbound, then rebuilds
-# and restarts the Compose stack locally. See docs/deploy-raspberry-pi.md.
+# Runs on a SELF-HOSTED runner installed on the Pi itself, because a home Pi
+# behind NAT/CGNAT cannot accept inbound connections from GitHub's cloud runners.
+# The runner polls GitHub outbound, then rebuilds and restarts the Compose stack
+# locally. Secrets (password, auth secret, domain, tunnel token) are injected
+# from GitHub Actions secrets — nothing sensitive lives in this public repo.
+#
+# SECURITY: this repo is public. The job triggers ONLY on push to main and manual
+# dispatch — never on pull_request — so fork PRs cannot run code on your Pi or see
+# your secrets. Also set repo Settings → Actions → General → "Require approval for
+# all external contributors". See docs/deploy-raspberry-pi.md.
 name: Deploy
 
 on:
@@ -24,10 +30,23 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build and (re)start the stack
-        working-directory: ${{ github.workspace }}
+        env:
+          # Injected from GitHub Actions secrets at run time; GitHub masks these
+          # in logs. APP_PASSWORD/AUTH_SECRET are required; ALLOWED_ORIGINS and
+          # TUNNEL_TOKEN stay empty until you have a domain.
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+          ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
         run: |
-          # .env lives next to the deploy checkout on the Pi and holds the real
-          # secrets (APP_PASSWORD, AUTH_SECRET, ALLOWED_ORIGINS, TUNNEL_TOKEN).
-          # It is NOT in git; symlink or copy it into the workspace once.
-          docker compose --profile tunnel up -d --build
+          set -euo pipefail
+          # Compose reads these from the environment for ${VAR} interpolation
+          # (env vars + build args). No secrets are written to disk.
+          if [ -n "${TUNNEL_TOKEN}" ]; then
+            echo "TUNNEL_TOKEN present → deploying with the Cloudflare tunnel."
+            docker compose --profile tunnel up -d --build
+          else
+            echo "No TUNNEL_TOKEN → deploying LAN-only (no public domain yet)."
+            docker compose up -d --build
+          fi
           docker image prune -f

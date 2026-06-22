@@ -1,171 +1,157 @@
-# Self-hosting on a Raspberry Pi (with Cloudflare Tunnel)
+# Self-hosting on a Raspberry Pi (CI/CD + optional Cloudflare Tunnel)
 
-This guide takes the app from "builds locally" to "running on a Raspberry Pi 5 in your
-house, reachable at **`tracker.jony.fr`** over HTTPS" — with **no port forwarding and no
-public IP**. It complements [deployment.md](deployment.md), which explains the Compose
-stack and Docker stages themselves.
+This guide takes the app from "in a public GitHub repo" to "running on a Raspberry Pi 5 in
+your house, auto-deployed on every `git push`." It works in two phases:
 
-## Why this shape
+1. **Now (no domain):** the app runs on the Pi, reachable on your LAN at `http://<pi-ip>:3000`.
+2. **Later (with a domain):** a Cloudflare Tunnel publishes it at `https://your-domain` — no
+   port forwarding, no public IP, works behind CGNAT.
 
-A home connection has a changing IP and is often behind **CGNAT** (common with French
-ISPs), so you usually *can't* forward ports to it reliably. A **Cloudflare Tunnel** sidesteps
-that: a small `cloudflared` daemon on the Pi makes an **outbound** connection to Cloudflare,
-and Cloudflare routes `tracker.jony.fr` traffic back down that tunnel. TLS is terminated at
-Cloudflare's edge — automatic, free, no certificates to manage.
+All secrets — password, auth secret, and (later) the domain and tunnel token — live in
+**GitHub Actions secrets**, never in this public repo. A **self-hosted runner on the Pi** does
+the deploys. It complements [deployment.md](deployment.md) (the Compose stack / Docker stages).
+
+## How the deploy works
 
 ```
- Browser ──HTTPS──► Cloudflare edge ──encrypted tunnel──► cloudflared ──► app:3000
- (tracker.jony.fr)   (TLS terminated)   (outbound only)      (on the Pi, Docker network)
+ git push main ─► GitHub ─► (self-hosted runner ON the Pi polls outbound)
+                              │
+                              ├─ injects secrets from GitHub Actions secrets
+                              └─ docker compose up -d --build   (rebuild + restart)
 ```
 
-The same "outbound only" trick powers optional CI/CD: a **self-hosted GitHub Actions runner**
-on the Pi polls GitHub and redeploys on push — again, no inbound ports.
+The runner polls GitHub from inside your network, so **no inbound ports** are ever opened.
+`.github/workflows/deploy.yml` passes the secrets as environment variables to `docker compose`;
+nothing sensitive is written to disk, and GitHub masks the values in logs.
+
+> ⚠️ **Public repo + self-hosted runner.** The workflow triggers **only** on push to `main`
+> (which only you can do) and manual dispatch — never on `pull_request` — so a stranger's fork
+> PR can't execute code on your Pi or read your secrets. As belt-and-suspenders, set
+> **repo → Settings → Actions → General → Fork pull request workflows → "Require approval for
+> all external contributors."** Don't add `pull_request` triggers to this workflow.
 
 ## Architecture notes (already handled in code)
 
 - **ARM64 just works.** `node:22-slim` and `postgres:16-alpine` are multi-arch; Prisma's
-  `binaryTargets = ["native"]` means building *on the Pi* produces the correct ARM query engine.
-- **Server Action origin check.** Behind the tunnel the public host (`tracker.jony.fr`) differs
-  from the internal host (`app:3000`). Next.js 15 would reject every Server Action POST (i.e.
-  every create/edit/login) unless the public origin is whitelisted. `next.config.ts` reads
-  `ALLOWED_ORIGINS` for this; set it in `.env` (see below).
-- **Secure cookie.** The session cookie is `Secure` in production. The browser sees HTTPS from
-  Cloudflare, so login works — no change needed.
-- **Tunnel is opt-in.** The `tunnel` service sits behind a Compose `profiles: [tunnel]` so local
-  `docker compose up` never tries to start it. On the Pi you run with `--profile tunnel`.
+  `binaryTargets = ["native"]` means building *on the Pi* yields the correct ARM query engine.
+- **Server Action origin check.** Behind a tunnel the public host differs from the internal host
+  (`app:3000`); Next.js 15 would reject every Server Action POST unless the public origin is
+  whitelisted. `next.config.ts` reads `ALLOWED_ORIGINS`, which is **baked in at build time** and
+  passed as a Docker build arg (`docker-compose.yml`) from the `ALLOWED_ORIGINS` secret. Empty
+  until you have a domain; localhost/LAN access doesn't need it.
+- **Tunnel is opt-in.** The `tunnel` service sits behind a Compose `profiles: [tunnel]`. The
+  workflow enables it automatically **only when the `TUNNEL_TOKEN` secret is set.**
 
 ---
 
 ## Part 1 — Prepare the Pi
 
-1. **Install 64-bit Raspberry Pi OS** (Lite is enough — no desktop needed). Verify:
-   ```bash
-   uname -m      # expect: aarch64
-   ```
-2. **Install Docker + Compose plugin:**
+1. **64-bit Raspberry Pi OS** (Lite is enough). Verify: `uname -m` → `aarch64`.
+2. **Docker + Compose, set to start on boot:**
    ```bash
    curl -fsSL https://get.docker.com | sh
    sudo usermod -aG docker "$USER"     # log out/in so docker works without sudo
-   docker compose version              # confirm the compose plugin is present
-   ```
-3. **Get the code onto the Pi:**
-   ```bash
-   git clone <your-repo-url> ~/position-tracker
-   cd ~/position-tracker
+   sudo systemctl enable docker        # autostart on boot → survives power cuts
+   docker compose version
    ```
 
-> Pi 5 (4–8 GB) builds Next.js comfortably. If a build ever gets OOM-killed, add swap:
+> Pi 5 (4–8 GB) builds Next.js comfortably. If a build is ever OOM-killed, add swap:
 > `sudo dphys-swapfile swapoff && sudo sed -i 's/^CONF_SWAPSIZE=.*/CONF_SWAPSIZE=2048/' /etc/dphys-swapfile && sudo dphys-swapfile setup && sudo dphys-swapfile swapon`.
 
-## Part 2 — Configure secrets
+## Part 2 — Set the GitHub Actions secrets
 
-Create `~/position-tracker/.env` (gitignored) from the template:
-
-```bash
-cp .env.example .env
-```
-
-Then set real values:
+From your laptop (or anywhere with `gh`), in the repo:
 
 ```bash
-APP_PASSWORD="<a strong password>"
-AUTH_SECRET="<long random string>"     # e.g. `openssl rand -hex 32`
-ALLOWED_ORIGINS="tracker.jony.fr"
-TUNNEL_TOKEN=""                         # filled in Part 4
+gh secret set APP_PASSWORD --body "<a strong password>"
+gh secret set AUTH_SECRET  --body "$(openssl rand -hex 32)"
+# ALLOWED_ORIGINS and TUNNEL_TOKEN are added later, in Part 5 (domain phase).
 ```
 
-`DATABASE_URL` is **not** needed here — Compose wires the app/migrate services to the
-in-stack `db` host automatically.
+Or via the web UI: **repo → Settings → Secrets and variables → Actions → New repository secret.**
+These are write-only — GitHub never shows them again, and they're injected only during a
+workflow run on your runner.
 
-## Part 3 — Point jony.fr at Cloudflare (one-time)
+## Part 3 — Install the self-hosted runner on the Pi
 
-The tunnel requires the domain's DNS to be managed by Cloudflare (free plan is fine).
-
-1. Create a free account at <https://dash.cloudflare.com>.
-2. **Add a site** → enter `jony.fr` → pick the Free plan.
-3. Cloudflare gives you **two nameservers** (e.g. `xena.ns.cloudflare.com`). Go to wherever you
-   registered `jony.fr` and replace its nameservers with those two.
-4. Wait for Cloudflare to show the domain as **Active** (minutes to a few hours).
-
-## Part 4 — Create the tunnel
-
-1. In the Cloudflare dashboard: **Zero Trust** → **Networks** → **Tunnels** → **Create a tunnel**.
-2. Choose **Cloudflared**, name it (e.g. `home-pi`), **Save**.
-3. On the install screen, copy the **tunnel token** — the long string after `--token` in the
-   command they show. Put it in `.env`:
+1. **repo → Settings → Actions → Runners → New self-hosted runner → Linux / ARM64.** Follow the
+   shown download + `./config.sh --url ... --token ...` steps **on the Pi**. Accept the default
+   labels (they include `self-hosted`, `linux`, `ARM64` — which the workflow targets).
+2. **Install it as a service** so it runs headless and survives reboots:
    ```bash
-   TUNNEL_TOKEN="eyJ...the-long-token..."
+   cd ~/actions-runner
+   sudo ./svc.sh install
+   sudo ./svc.sh start
    ```
-   (You do **not** run their `cloudflared` install command — our Compose `tunnel` service runs it.)
-4. Add a **public hostname** for the tunnel:
-   - **Subdomain:** `tracker`  **Domain:** `jony.fr`
-   - **Type:** `HTTP`  **URL:** `app:3000`
-     (the service name on the Compose network — that's how the tunnel reaches the app)
-5. **Save.** Cloudflare auto-creates the `tracker.jony.fr` DNS record for you.
 
-## Part 5 — Launch
+The runner now polls GitHub. No Docker or repo clone needed by hand — the workflow checks the
+code out into the runner's workspace and builds there.
 
-```bash
-cd ~/position-tracker
-docker compose --profile tunnel up -d --build
-```
+## Part 4 — First deploy (LAN, no domain yet)
 
-This builds the ARM images, runs `migrate` (syncs the schema), starts `app`, and starts the
-`tunnel`. Verify:
+Trigger a deploy. Either push any commit to `main`, or run it manually:
 
 ```bash
-docker compose ps -a                 # migrate should be "exited (0)"; app + tunnel "running"
-curl -I http://localhost:3000        # on the Pi: expect a redirect to /login
-docker compose logs tunnel           # expect "Registered tunnel connection" lines
+gh workflow run deploy.yml      # or: push to main
+gh run watch                    # follow the run
 ```
 
-Then open **https://tracker.jony.fr** from anywhere → you should hit the login page and be
-able to sign in with `APP_PASSWORD`.
+The runner builds the ARM images, runs `migrate` (schema sync), and starts `app`. Because no
+`TUNNEL_TOKEN` secret is set yet, it deploys **LAN-only**. Find the Pi's IP (`hostname -I`) and
+open from any device on your network:
+
+```
+http://<pi-ip>:3000
+```
+
+You should hit the login page and sign in with `APP_PASSWORD`. Server Actions work fine here:
+direct access means the request Origin matches the host, so no `ALLOWED_ORIGINS` is needed.
 
 ---
 
-## Part 6 — Auto-deploy on push (optional)
+## Part 5 — Add a domain later (Cloudflare Tunnel)
 
-A self-hosted runner on the Pi turns `git push` into a deploy. `.github/workflows/deploy.yml`
-is already in the repo and targets a `[self-hosted, linux, ARM64]` runner.
+When you've bought a domain and want public HTTPS access at `https://tracker.<your-domain>`:
 
-1. **Install the runner** (GitHub repo → **Settings → Actions → Runners → New self-hosted
-   runner → Linux / ARM64**) and follow the shown `./config.sh` / `./run.sh` steps **inside a
-   checkout the workflow will use** (the workflow checks out into the runner's `_work` dir).
-2. **Install it as a service** so it survives reboots:
+1. **Put the domain on Cloudflare** (free): dash.cloudflare.com → Add a site → switch the
+   domain's nameservers to the two Cloudflare gives you → wait for **Active**.
+2. **Create a tunnel:** Zero Trust → Networks → Tunnels → Create → Cloudflared. Copy the
+   **tunnel token**. Add a **public hostname**: subdomain `tracker`, your domain, **Type** `HTTP`,
+   **URL** `app:3000` (the Compose service name). Save — Cloudflare creates the DNS record.
+3. **Add the two secrets** (the domain stays out of the repo this way):
    ```bash
-   sudo ./svc.sh install && sudo ./svc.sh start
+   gh secret set ALLOWED_ORIGINS --body "tracker.<your-domain>"
+   gh secret set TUNNEL_TOKEN    --body "<the-tunnel-token>"
    ```
-3. **Make `.env` available to the workflow's checkout.** The runner checks out a fresh copy under
-   `~/actions-runner/_work/position-tracker/position-tracker`, so symlink your real `.env` in:
-   ```bash
-   ln -s ~/position-tracker/.env \
-     ~/actions-runner/_work/position-tracker/position-tracker/.env
-   ```
-   Keep secrets on the Pi, never in GitHub. (Persisting the `db_data` volume is handled by
-   Compose, so rebuilds don't lose data.)
+4. **Redeploy:** `gh workflow run deploy.yml`. The workflow now sees `TUNNEL_TOKEN`, brings up the
+   `tunnel` service, and rebuilds the app with the right `ALLOWED_ORIGINS` baked in.
 
-Now every push to `main` rebuilds and restarts the stack on the Pi.
+Open `https://tracker.<your-domain>` from anywhere. (Tighten LAN exposure if you like by adding
+an `APP_BIND_ADDR=127.0.0.1` secret/var so the app is only reachable via the tunnel.)
 
 ---
 
 ## Operations
 
-- **Update by hand:** `git pull && docker compose --profile tunnel up -d --build`
-- **Logs:** `docker compose logs -f app` (or `tunnel`)
-- **Restart:** `docker compose --profile tunnel restart app`
-- **Stop everything:** `docker compose --profile tunnel down`
+- **Deploy:** just `git push` to `main` (or `gh workflow run deploy.yml`).
+- **Logs:** `docker compose logs -f app` (or `tunnel`).
+- **Restart:** `docker compose restart app`.
+- **Reboots / power cuts:** Docker autostarts (Part 1) and restarts the containers with their
+  baked-in env, so the app comes back on its own; the tunnel reconnects automatically.
 - **Back up the database** (the only stateful piece — the `db_data` volume):
   ```bash
   docker compose exec db pg_dump -U postgres position_tracker > backup-$(date +%F).sql
   ```
+- **Run a manual deploy by hand** (outside CI): you must provide the env vars yourself, e.g.
+  `APP_PASSWORD=... AUTH_SECRET=... docker compose up -d --build`, since no `.env` is kept on disk.
 
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |
-| Login or any save fails with *"x-forwarded-host … does not match origin"* | `ALLOWED_ORIGINS` is unset/wrong. Set it to `tracker.jony.fr` in `.env`, then `up -d --build`. |
-| `tracker.jony.fr` shows a Cloudflare 1033 / "tunnel not found" | Tunnel container isn't running or `TUNNEL_TOKEN` is wrong. Check `docker compose logs tunnel`. |
-| Site loads on the Pi (`localhost:3000`) but not publicly | Tunnel route points at the wrong service. In the dashboard it must be `HTTP → app:3000`. |
-| Build killed / runs out of memory | Add swap (see Part 1 note). |
-| Login page loops back to itself | `AUTH_SECRET` changed between deploys (invalidates existing cookies) — just log in again. |
+| Workflow stuck "Queued" | The self-hosted runner isn't online. `sudo ./svc.sh status` on the Pi. |
+| Login or any save fails with *"x-forwarded-host … does not match origin"* | `ALLOWED_ORIGINS` secret missing/wrong. Set it to your public host and **redeploy** (it's baked in at build, so a rebuild is required). |
+| Public URL shows Cloudflare 1033 / "tunnel not found" | Tunnel container not running or `TUNNEL_TOKEN` wrong. `docker compose logs tunnel`. |
+| Loads on the LAN but not publicly | Tunnel public hostname must route `HTTP → app:3000` in the dashboard. |
+| Build killed / out of memory | Add swap (see Part 1 note). |
+| Login loops back | `AUTH_SECRET` changed between deploys (invalidates cookies) — just log in again. |
