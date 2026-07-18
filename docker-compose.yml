@@ -32,20 +32,3 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-
-  # Cloudflare Tunnel: makes an OUTBOUND connection to Cloudflare and serves the
-  # app on your domain without any open inbound ports / port forwarding. The route
-  # (hostname -> http://app:3000) and TLS are configured in the Cloudflare
-  # Zero Trust dashboard; this container just needs the tunnel token.
-  # Only starts when the "tunnel" profile is enabled (see docs).
-  tunnel:
-    image: cloudflare/cloudflared:latest
-    restart: unless-stopped
-    command: tunnel --no-autoupdate run
-    environment:
-      TUNNEL_TOKEN: "${TUNNEL_TOKEN:-}"
-    depends_on:
-      app:
-        condition: service_started
-    profiles:
-      - tunnel

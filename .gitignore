@@ -17,3 +17,4 @@ prisma/dev.db*
 .vscode/
 *.tsbuildinfo
 next-env.d.ts
+.claude

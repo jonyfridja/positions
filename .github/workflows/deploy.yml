@@ -1,15 +1,14 @@
-# Auto-deploy to the Raspberry Pi on every push to main.
+# Auto-deploy to the Raspberry Pi on every push to main. Runs on a GitHub-hosted
+# runner, reaching the Pi (no open inbound ports) by SSH over the Cloudflare
+# Tunnel's SSH route, via a host-level `cloudflared` on the Pi (not a Docker
+# service) and a Cloudflare Access Service Token — non-interactive, no browser
+# prompt. The remote command does `git pull` + `docker compose build` ON the
+# Pi. Secrets get written to a .env file on the Pi's disk (mode 600) since
+# compose runs there, not on this runner. cloudflared is pinned to 2026.5.1,
+# NOT "latest" — 2026.6.0 has an open regression (cloudflare/cloudflared#1673)
+# where `access ssh` ignores service-token creds and hangs on browser auth.
+# Full setup + rationale: docs/deploy-raspberry-pi.md.
 #
-# Runs on a SELF-HOSTED runner installed on the Pi itself, because a home Pi
-# behind NAT/CGNAT cannot accept inbound connections from GitHub's cloud runners.
-# The runner polls GitHub outbound, then rebuilds and restarts the Compose stack
-# locally. Secrets (password, auth secret, domain, tunnel token) are injected
-# from GitHub Actions secrets — nothing sensitive lives in this public repo.
-#
-# SECURITY: this repo is public. The job triggers ONLY on push to main and manual
-# dispatch — never on pull_request — so fork PRs cannot run code on your Pi or see
-# your secrets. Also set repo Settings → Actions → General → "Require approval for
-# all external contributors". See docs/deploy-raspberry-pi.md.
 name: Deploy
 
 on:
@@ -24,41 +23,78 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, linux, ARM64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Check out the pushed commit
-        uses: actions/checkout@v4
-
-      - name: Build and (re)start the stack
+      - name: Validate required secrets/vars are set
         env:
-          # Injected from GitHub Actions secrets at run time; GitHub masks these
-          # in logs. DATABASE_URL/APP_PASSWORD/AUTH_SECRET are required;
-          # ALLOWED_ORIGINS and TUNNEL_TOKEN stay empty until you have a domain.
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PI_SSH_KEY: ${{ secrets.PI_SSH_KEY }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          PI_USERNAME: ${{ vars.PI_USERNAME }}
+          PI_DEPLOY_PATH: ${{ vars.PI_DEPLOY_PATH }}
+          CF_SSH_HOSTNAME: ${{ vars.CF_SSH_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for v in DATABASE_URL PI_SSH_KEY CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET \
+                   PI_USERNAME PI_DEPLOY_PATH CF_SSH_HOSTNAME; do
+            if [ -z "${!v}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing required secret(s)/var(s):$missing" >&2
+            echo "Secrets: gh secret set <NAME> --body '<value>'" >&2
+            echo "Vars:    gh variable set <NAME> --body '<value>'" >&2
+            echo "See docs/deploy-raspberry-pi.md for what each one is." >&2
+            exit 1
+          fi
+
+      - name: Install cloudflared (pinned — see header comment)
+        run: |
+          curl -fsSL --output cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/download/2026.5.1/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Set up deploy key
+        env:
+          PI_SSH_KEY: ${{ secrets.PI_SSH_KEY }}
+        run: |
+          install -m 600 -D /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$PI_SSH_KEY" > ~/.ssh/deploy_key
+
+      - name: Sync production secrets to the Pi's .env
+        env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
           AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
           ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
-          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "${DATABASE_URL}" ]; then
-            echo "DATABASE_URL secret is not set. Production has no bundled" \
-                 "database — set it to your Postgres connection string:" \
-                 "gh secret set DATABASE_URL --body '<connection string>'" >&2
-            exit 1
-          fi
+          # Built and base64'd here so no secret value appears unescaped inside
+          # the remote command string.
+          ENV_B64=$(printf 'DATABASE_URL=%s\nAPP_PASSWORD=%s\nAUTH_SECRET=%s\nALLOWED_ORIGINS=%s\n' \
+            "$DATABASE_URL" "${APP_PASSWORD:-changeme}" "${AUTH_SECRET:-dev-secret-change-me}" \
+            "$ALLOWED_ORIGINS" | base64 -w0)
+          ssh -o "ProxyCommand=cloudflared access ssh --hostname %h --id ${{ secrets.CF_ACCESS_CLIENT_ID }} --secret ${{ secrets.CF_ACCESS_CLIENT_SECRET }}" \
+              -o StrictHostKeyChecking=accept-new \
+              -i ~/.ssh/deploy_key \
+              "${{ vars.PI_USERNAME }}@${{ vars.CF_SSH_HOSTNAME }}" \
+              "install -m 600 -D /dev/null ${{ vars.PI_DEPLOY_PATH }}/.env && echo $ENV_B64 | base64 -d > ${{ vars.PI_DEPLOY_PATH }}/.env"
+
+      - name: Deploy over SSH via Cloudflare Access
+        run: |
+          set -euo pipefail
           # -f pins this to the base compose file plus the prod-only network
           # overlay (joins the external "shared-db-net" network so app/migrate
-          # can reach the Postgres container running there). The local-dev
+          # can reach the Postgres container running there); the local-dev
           # docker-compose.override.yml (bundled Postgres) never applies here.
-          # Compose reads these from the environment for ${VAR} interpolation
-          # (env vars + build args). No secrets are written to disk.
-          COMPOSE_FILES="-f docker-compose.yml -f docker-compose.prod.yml"
-          if [ -n "${TUNNEL_TOKEN}" ]; then
-            echo "TUNNEL_TOKEN present → deploying with the Cloudflare tunnel."
-            docker compose $COMPOSE_FILES --profile tunnel up -d --build
-          else
-            echo "No TUNNEL_TOKEN → deploying LAN-only (no public domain yet)."
-            docker compose $COMPOSE_FILES up -d --build
-          fi
-          docker image prune -f
+          # No tunnel service/profile here — cloudflared runs as a host service
+          # on the Pi, outside this compose project entirely.
+          ssh -o "ProxyCommand=cloudflared access ssh --hostname %h --id ${{ secrets.CF_ACCESS_CLIENT_ID }} --secret ${{ secrets.CF_ACCESS_CLIENT_SECRET }}" \
+              -o StrictHostKeyChecking=accept-new \
+              -i ~/.ssh/deploy_key \
+              "${{ vars.PI_USERNAME }}@${{ vars.CF_SSH_HOSTNAME }}" \
+              "cd ${{ vars.PI_DEPLOY_PATH }} && git pull --ff-only && \
+               docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build && \
+               docker image prune -f"
