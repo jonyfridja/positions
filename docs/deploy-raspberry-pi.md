@@ -7,9 +7,19 @@ your house, auto-deployed on every `git push`." It works in two phases:
 2. **Later (with a domain):** a Cloudflare Tunnel publishes it at `https://your-domain` — no
    port forwarding, no public IP, works behind CGNAT.
 
-All secrets — password, auth secret, and (later) the domain and tunnel token — live in
-**GitHub Actions secrets**, never in this public repo. A **self-hosted runner on the Pi** does
+All secrets — database URL, password, auth secret, and (later) the domain and tunnel token — live
+in **GitHub Actions secrets**, never in this public repo. A **self-hosted runner on the Pi** does
 the deploys. It complements [deployment.md](deployment.md) (the Compose stack / Docker stages).
+
+> **Production has no bundled database.** Locally, `docker-compose.override.yml` spins up a
+> disposable `postgres:16-alpine` container automatically. That file is dev-only; the Pi deploy
+> instead runs `docker compose -f docker-compose.yml -f docker-compose.prod.yml ...`. The prod
+> overlay joins `app`/`migrate` to an **external Docker network named `shared-db-net`** — expected
+> to already exist on the Pi, with your production Postgres container attached to it (e.g. its own
+> separate Compose stack, or one started with `docker network create shared-db-net` +
+> `docker run --network shared-db-net ...`). `DATABASE_URL` then addresses that Postgres container
+> by its name on `shared-db-net` (e.g. `postgresql://user:pass@postgres:5432/dbname?schema=public`
+> if that stack's service/container is named `postgres`). See Part 2.
 
 ## How the deploy works
 
@@ -17,12 +27,16 @@ the deploys. It complements [deployment.md](deployment.md) (the Compose stack / 
  git push main ─► GitHub ─► (self-hosted runner ON the Pi polls outbound)
                               │
                               ├─ injects secrets from GitHub Actions secrets
-                              └─ docker compose up -d --build   (rebuild + restart)
+                              └─ docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+                                   up -d --build   (rebuild + restart, joins shared-db-net)
 ```
 
 The runner polls GitHub from inside your network, so **no inbound ports** are ever opened.
 `.github/workflows/deploy.yml` passes the secrets as environment variables to `docker compose`;
-nothing sensitive is written to disk, and GitHub masks the values in logs.
+nothing sensitive is written to disk, and GitHub masks the values in logs. The workflow pins
+`-f docker-compose.yml -f docker-compose.prod.yml` so the local-dev override file (bundled
+Postgres) never applies here, `app`/`migrate` join `shared-db-net`, and the whole thing fails fast
+if `DATABASE_URL` isn't set or `shared-db-net` doesn't exist yet.
 
 > ⚠️ **Public repo + self-hosted runner.** The workflow triggers **only** on push to `main`
 > (which only you can do) and manual dispatch — never on `pull_request` — so a stranger's fork
@@ -32,8 +46,9 @@ nothing sensitive is written to disk, and GitHub masks the values in logs.
 
 ## Architecture notes (already handled in code)
 
-- **ARM64 just works.** `node:22-slim` and `postgres:16-alpine` are multi-arch; Prisma's
-  `binaryTargets = ["native"]` means building *on the Pi* yields the correct ARM query engine.
+- **ARM64 just works.** `node:22-slim` (and, for local dev, `postgres:16-alpine`) are multi-arch;
+  Prisma's `binaryTargets = ["native"]` means building *on the Pi* yields the correct ARM query
+  engine, regardless of what's on the other end of `DATABASE_URL`.
 - **Server Action origin check.** Behind a tunnel the public host differs from the internal host
   (`app:3000`); Next.js 15 would reject every Server Action POST unless the public origin is
   whitelisted. `next.config.ts` reads `ALLOWED_ORIGINS`, which is **baked in at build time** and
@@ -41,6 +56,9 @@ nothing sensitive is written to disk, and GitHub masks the values in logs.
   until you have a domain; localhost/LAN access doesn't need it.
 - **Tunnel is opt-in.** The `tunnel` service sits behind a Compose `profiles: [tunnel]`. The
   workflow enables it automatically **only when the `TUNNEL_TOKEN` secret is set.**
+- **`shared-db-net` is external and must pre-exist.** `docker-compose.prod.yml` declares it
+  `external: true` — Compose refuses to start if it's missing, it never creates it for you. Set
+  it up once (Part 1) and attach your production Postgres container to it.
 
 ---
 
@@ -54,6 +72,20 @@ nothing sensitive is written to disk, and GitHub masks the values in logs.
    sudo systemctl enable docker        # autostart on boot → survives power cuts
    docker compose version
    ```
+3. **Create the shared database network and run production Postgres on it:**
+   ```bash
+   docker network create shared-db-net
+   docker run -d --name postgres --restart unless-stopped \
+     --network shared-db-net \
+     -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD='<a strong password>' \
+     -e POSTGRES_DB=position_tracker \
+     -v pg_data:/var/lib/postgresql/data \
+     postgres:16-alpine
+   ```
+   Use whatever container name you like — it's what `DATABASE_URL` will reference as the
+   hostname (`postgres` in the example above). If you already run Postgres elsewhere on the Pi
+   (its own Compose stack, etc.), just attach *that* container to `shared-db-net` instead:
+   `docker network connect shared-db-net <existing-postgres-container>`.
 
 > Pi 5 (4–8 GB) builds Next.js comfortably. If a build is ever OOM-killed, add swap:
 > `sudo dphys-swapfile swapoff && sudo sed -i 's/^CONF_SWAPSIZE=.*/CONF_SWAPSIZE=2048/' /etc/dphys-swapfile && sudo dphys-swapfile setup && sudo dphys-swapfile swapon`.
@@ -63,10 +95,17 @@ nothing sensitive is written to disk, and GitHub masks the values in logs.
 From your laptop (or anywhere with `gh`), in the repo:
 
 ```bash
+gh secret set DATABASE_URL --body "postgresql://postgres:<password>@postgres:5432/position_tracker?schema=public"
 gh secret set APP_PASSWORD --body "<a strong password>"
 gh secret set AUTH_SECRET  --body "$(openssl rand -hex 32)"
 # ALLOWED_ORIGINS and TUNNEL_TOKEN are added later, in Part 5 (domain phase).
 ```
+
+The hostname in `DATABASE_URL` must be the **container/service name of your production Postgres
+on `shared-db-net`** (from Part 1's setup) — not `localhost`, not an IP. Compose resolves it via
+that shared network. The deploy workflow has no fallback and will fail before starting anything
+if this secret is missing, and it will fail at `docker compose ... up` if `shared-db-net` itself
+doesn't exist yet.
 
 Or via the web UI: **repo → Settings → Secrets and variables → Actions → New repository secret.**
 These are write-only — GitHub never shows them again, and they're injected only during a
@@ -138,18 +177,21 @@ an `APP_BIND_ADDR=127.0.0.1` secret/var so the app is only reachable via the tun
 - **Restart:** `docker compose restart app`.
 - **Reboots / power cuts:** Docker autostarts (Part 1) and restarts the containers with their
   baked-in env, so the app comes back on its own; the tunnel reconnects automatically.
-- **Back up the database** (the only stateful piece — the `db_data` volume):
-  ```bash
-  docker compose exec db pg_dump -U postgres position_tracker > backup-$(date +%F).sql
-  ```
+- **Back up the database:** production has no bundled `db` container or volume in this compose
+  project — back up whatever Postgres container you attached to `shared-db-net` directly, e.g.
+  `docker exec postgres pg_dump -U postgres position_tracker > backup-$(date +%F).sql`.
 - **Run a manual deploy by hand** (outside CI): you must provide the env vars yourself, e.g.
-  `APP_PASSWORD=... AUTH_SECRET=... docker compose up -d --build`, since no `.env` is kept on disk.
+  `DATABASE_URL=... APP_PASSWORD=... AUTH_SECRET=... docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build`,
+  since no `.env` is kept on disk.
 
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
 | --- | --- |
 | Workflow stuck "Queued" | The self-hosted runner isn't online. `sudo ./svc.sh status` on the Pi. |
+| Deploy fails immediately with "DATABASE_URL secret is not set" | `gh secret set DATABASE_URL --body "<connection string>"` — production has no bundled database. |
+| Deploy fails with "network shared-db-net declared as external, but could not be found" | Create it once: `docker network create shared-db-net`, then attach your Postgres container to it (Part 1) and redeploy. |
+| `app`/`migrate` can't reach the database (`ECONNREFUSED` / DNS lookup failure for the `DATABASE_URL` host) | The hostname in `DATABASE_URL` must be the Postgres container's name **and** it must actually be attached to `shared-db-net` (`docker network inspect shared-db-net`). |
 | Login or any save fails with *"x-forwarded-host … does not match origin"* | `ALLOWED_ORIGINS` secret missing/wrong. Set it to your public host and **redeploy** (it's baked in at build, so a rebuild is required). |
 | Public URL shows Cloudflare 1033 / "tunnel not found" | Tunnel container not running or `TUNNEL_TOKEN` wrong. `docker compose logs tunnel`. |
 | Loads on the LAN but not publicly | Tunnel public hostname must route `HTTP → app:3000` in the dashboard. |

@@ -32,21 +32,33 @@ jobs:
       - name: Build and (re)start the stack
         env:
           # Injected from GitHub Actions secrets at run time; GitHub masks these
-          # in logs. APP_PASSWORD/AUTH_SECRET are required; ALLOWED_ORIGINS and
-          # TUNNEL_TOKEN stay empty until you have a domain.
+          # in logs. DATABASE_URL/APP_PASSWORD/AUTH_SECRET are required;
+          # ALLOWED_ORIGINS and TUNNEL_TOKEN stay empty until you have a domain.
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
           AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
           ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
           TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${DATABASE_URL}" ]; then
+            echo "DATABASE_URL secret is not set. Production has no bundled" \
+                 "database — set it to your Postgres connection string:" \
+                 "gh secret set DATABASE_URL --body '<connection string>'" >&2
+            exit 1
+          fi
+          # -f pins this to the base compose file plus the prod-only network
+          # overlay (joins the external "shared-db-net" network so app/migrate
+          # can reach the Postgres container running there). The local-dev
+          # docker-compose.override.yml (bundled Postgres) never applies here.
           # Compose reads these from the environment for ${VAR} interpolation
           # (env vars + build args). No secrets are written to disk.
+          COMPOSE_FILES="-f docker-compose.yml -f docker-compose.prod.yml"
           if [ -n "${TUNNEL_TOKEN}" ]; then
             echo "TUNNEL_TOKEN present → deploying with the Cloudflare tunnel."
-            docker compose --profile tunnel up -d --build
+            docker compose $COMPOSE_FILES --profile tunnel up -d --build
           else
             echo "No TUNNEL_TOKEN → deploying LAN-only (no public domain yet)."
-            docker compose up -d --build
+            docker compose $COMPOSE_FILES up -d --build
           fi
           docker image prune -f

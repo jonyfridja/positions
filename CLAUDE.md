@@ -18,7 +18,8 @@ a single password.
 - **Prisma** ORM → **PostgreSQL**
 - **Tailwind CSS v4**
 - **pnpm** — the package manager. **Never use `npm` or `yarn`.**
-- **Docker Compose** for the full stack (`db` + one-shot `migrate` + `app`)
+- **Docker Compose** for the full stack (one-shot `migrate` + `app`; local dev also gets a bundled
+  `db` via `docker-compose.override.yml` — production supplies its own `DATABASE_URL` instead)
 
 ## Commands
 
@@ -77,6 +78,13 @@ Full detail + recipes: [docs/conventions.md](docs/conventions.md) and [docs/play
   and rerunning the stack; there are no committed migrations to review.
 - Prisma `binaryTargets = ["native"]`; build and runtime both use `node:22-slim` so the query
   engine matches. Keep them on the same base image.
+- `docker-compose.override.yml` (bundled Postgres) is merged **automatically** by plain
+  `docker compose` invocations — that's what makes `pnpm docker:up` work locally with zero setup.
+  Any command meant to run against production must pass
+  `-f docker-compose.yml -f docker-compose.prod.yml` explicitly (as
+  `.github/workflows/deploy.yml` does) or it'll silently pick up the local db and the wrong
+  `DATABASE_URL`, and won't join the `shared-db-net` external network the production Postgres
+  container lives on.
 - The detail page reads `STATUS_META[record.status as keyof …]` and guards with `meta &&` —
   unknown statuses render without a badge rather than crashing.
 

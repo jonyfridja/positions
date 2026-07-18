@@ -16,7 +16,7 @@ cp .env.example .env
 
 | Var | Purpose |
 | --- | --- |
-| `DATABASE_URL` | Postgres connection string. Host runs use `localhost`; the Docker `app`/`migrate` services override this to the internal `db` host. |
+| `DATABASE_URL` | Postgres connection string for **host-side** commands (`pnpm dev`, `db:push`, `db:seed`, `db:studio`) — use `localhost`. `pnpm docker:up` ignores this and provisions its own bundled Postgres via `docker-compose.override.yml`; production has no bundled database and requires its own `DATABASE_URL` secret. See [deployment.md](deployment.md). |
 | `APP_PASSWORD` | The single password to access the app. |
 | `AUTH_SECRET` | Secret used to derive/sign the session cookie. Rotating it logs everyone out. |
 
@@ -24,7 +24,7 @@ cp .env.example .env
 
 ## Run it: two ways
 
-### A. Docker (recommended — mirrors production)
+### A. Docker (recommended — closest to production)
 
 ```bash
 pnpm docker:up      # builds images, starts db → migrate → app
@@ -34,8 +34,10 @@ pnpm docker:down    # stop
 ```
 
 Startup order is enforced by compose: `db` becomes healthy, the one-shot `migrate` service runs
-`prisma db push` and exits 0, then `app` starts. See [deployment.md](deployment.md) for the stack
-internals.
+`prisma db push` and exits 0, then `app` starts. The `db` container comes from
+`docker-compose.override.yml`, which Compose merges in automatically here — it's a local-dev-only
+convenience; production runs `docker-compose.yml` alone against an external `DATABASE_URL`. See
+[deployment.md](deployment.md) for the stack internals.
 
 ### B. Local dev server (fast iteration)
 

@@ -1,0 +1,23 @@
+# Production-only network wiring. The production Postgres runs in its own
+# container/stack on the Pi, reachable via an external Docker network named
+# "shared-db-net" (must already exist on the host — this compose file doesn't
+# create it: `docker network create shared-db-net`). Attaching migrate/app to
+# it lets DATABASE_URL address the db by its container/service name.
+#
+# Only the Pi deploy workflow merges this in (`-f docker-compose.yml
+# -f docker-compose.prod.yml`). Local dev never does — it uses
+# docker-compose.override.yml and a bundled db on the default network instead.
+networks:
+  shared-db-net:
+    external: true
+
+services:
+  migrate:
+    networks:
+      - default
+      - shared-db-net
+
+  app:
+    networks:
+      - default
+      - shared-db-net

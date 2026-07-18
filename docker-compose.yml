@@ -1,31 +1,14 @@
 services:
-  db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: position_tracker
-    ports:
-      - "5432:5432"
-    volumes:
-      - db_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d position_tracker"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   # One-shot: syncs the Prisma schema to the database, then exits.
   migrate:
     build:
       context: .
       target: migrator
     environment:
-      DATABASE_URL: "postgresql://postgres:postgres@db:5432/position_tracker?schema=public"
-    depends_on:
-      db:
-        condition: service_healthy
+      # Postgres connection string. No local default here — production must
+      # supply a real one (GitHub Actions secret / host env). Local dev gets
+      # a bundled Postgres wired up automatically via docker-compose.override.yml.
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL is required (see .env.example)}"
     restart: "no"
 
   app:
@@ -38,7 +21,7 @@ services:
         ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-}"
     restart: unless-stopped
     environment:
-      DATABASE_URL: "postgresql://postgres:postgres@db:5432/position_tracker?schema=public"
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL is required (see .env.example)}"
       APP_PASSWORD: "${APP_PASSWORD:-changeme}"
       AUTH_SECRET: "${AUTH_SECRET:-dev-secret-change-me}"
     # Published on all interfaces by default so the app is reachable on the LAN
@@ -47,8 +30,6 @@ services:
     ports:
       - "${APP_BIND_ADDR:-0.0.0.0}:3000:3000"
     depends_on:
-      db:
-        condition: service_healthy
       migrate:
         condition: service_completed_successfully
 
@@ -68,6 +49,3 @@ services:
         condition: service_started
     profiles:
       - tunnel
-
-volumes:
-  db_data:

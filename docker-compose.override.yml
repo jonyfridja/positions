@@ -1,0 +1,40 @@
+# Local-dev-only additions, merged automatically by `docker compose` whenever it's
+# run without explicit -f flags (e.g. `pnpm docker:up`). Adds a bundled Postgres
+# container and points migrate/app at it, so local dev never needs an external
+# database. Production (the Pi deploy workflow) runs with `-f docker-compose.yml`
+# only, so this file — and its bundled db — never applies there; production
+# supplies its own DATABASE_URL instead. See docs/deployment.md.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: position_tracker
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d position_tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    environment:
+      DATABASE_URL: "postgresql://postgres:postgres@db:5432/position_tracker?schema=public"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    environment:
+      DATABASE_URL: "postgresql://postgres:postgres@db:5432/position_tracker?schema=public"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
